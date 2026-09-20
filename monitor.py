@@ -30,7 +30,10 @@ from urllib3.util.retry import Retry
 
 PORTAL_URL = "https://haryanarera.gov.in/admincontrol/registered_projects/1"
 BASE_URL = "https://haryanarera.gov.in/"
-PRIORITY_CITIES = {"GURUGRAM", "FARIDABAD"}
+UP_RERA_PROJECTS_URL = "https://www.up-rera.in/View_projects.aspx"
+UP_RERA_API_URL = "https://uprera.azurewebsites.net/admin_rera.asmx/get_disitrict_project"
+UP_RERA_DISTRICT = "Gautam Buddha Nagar"
+PRIORITY_CITIES = {"GURUGRAM", "FARIDABAD", "NOIDA / GREATER NOIDA"}
 STOP = False
 
 
@@ -48,16 +51,18 @@ class Project:
     form_url: str
     registration_date: str = "Not available"
     project_type: str = "Not available"
+    source: str = "Haryana RERA"
 
     @property
     def key(self) -> str:
         registration = re.sub(r"\s+", " ", self.registration_number).strip().upper()
         raw = registration if registration not in {"", "NA", "N/A", "NOT AVAILABLE"} else (self.portal_project_id or self.detail_url)
-        return re.sub(r"\s+", " ", raw).strip().upper()
+        normalized = re.sub(r"\s+", " ", raw).strip().upper()
+        return f"{self.source.upper()}::{normalized}"
 
     @property
     def priority(self) -> bool:
-        return self.city.upper() in PRIORITY_CITIES
+        return self.city.upper() in PRIORITY_CITIES or self.source.upper() == "UP RERA"
 
 
 def required_env(name: str) -> str:
@@ -83,7 +88,7 @@ def make_session() -> requests.Session:
         read=4,
         backoff_factor=1.5,
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET"}),
+        allowed_methods=frozenset({"GET", "POST"}),
         respect_retry_after_header=True,
     )
     session.mount("https://", HTTPAdapter(max_retries=retry))
@@ -140,6 +145,70 @@ def extract_registered_projects(page: str) -> list[Project]:
     return projects
 
 
+UP_PROJECT_PATTERN = re.compile(
+    r'\{"application_id":"(?P<application_id>.*?)",'
+    r'"registration_id":"(?P<registration_id>.*?)",'
+    r'"promoter_name":"(?P<promoter_name>.*?)",'
+    r'"project_name":"(?P<project_name>.*?)",'
+    r'"applicant_type":"(?P<applicant_type>.*?)",'
+    r'"district":"(?P<district>.*?)",'
+    r'"Project_catagory":"(?P<Project_catagory>.*?)",'
+    r'"Project_type":"(?P<Project_type>.*?)"\}',
+    re.S,
+)
+
+
+def extract_up_rera_projects(raw: str) -> list[Project]:
+    """Parse the UP RERA map service, whose inner JSON contains unescaped title quotes."""
+    records = [match.groupdict() for match in UP_PROJECT_PATTERN.finditer(raw)]
+    projects: list[Project] = []
+    for record in records:
+        registration = clean(record["registration_id"])
+        month_year = re.search(r"/(0[1-9]|1[0-2])/(20\d{2})$", registration)
+        registration_date = "Not available in district list"
+        if month_year:
+            registration_date += f" (registration number indicates {month_year.group(1)}/{month_year.group(2)})"
+        category = clean(record["Project_catagory"])
+        application_type = clean(record["applicant_type"])
+        project_type = category or "Not available"
+        if application_type:
+            project_type += f" ({application_type})"
+        projects.append(
+            Project(
+                registration_number=registration,
+                portal_project_id=clean(record["application_id"]),
+                name=clean(record["project_name"]).strip('"'),
+                builder=clean(record["promoter_name"]),
+                location="Gautam Buddha Nagar district (Noida, Greater Noida and Yamuna Expressway)",
+                city="NOIDA / GREATER NOIDA",
+                registered_with="UP RERA",
+                registration_valid_until="Not available",
+                detail_url=UP_RERA_PROJECTS_URL,
+                form_url="",
+                registration_date=registration_date,
+                project_type=project_type,
+                source="UP RERA",
+            )
+        )
+    if len(projects) < 500:
+        raise RuntimeError(f"Only {len(projects)} UP RERA projects parsed; refusing a suspicious partial result")
+    return projects
+
+
+def get_up_rera_projects(session: requests.Session) -> list[Project]:
+    response = session.post(
+        UP_RERA_API_URL,
+        json={"district": UP_RERA_DISTRICT},
+        timeout=(15, 90),
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+    response.raise_for_status()
+    inner = response.json().get("d", "")
+    if not isinstance(inner, str):
+        raise RuntimeError("Unexpected UP RERA district-service response")
+    return extract_up_rera_projects(inner)
+
+
 def table_records(soup: BeautifulSoup) -> Iterable[dict[str, str]]:
     for table in soup.select("table"):
         headers = [clean(x.get_text(" ", strip=True)) for x in table.select("thead th")]
@@ -179,7 +248,7 @@ def infer_project_type(project: Project, form_page: str | None) -> str:
 
 def enrich_project(session: requests.Session, project: Project) -> Project:
     values = asdict(project)
-    if project.detail_url:
+    if project.source == "Haryana RERA" and project.detail_url:
         detail_soup = BeautifulSoup(get_html(session, project.detail_url), "html.parser")
         for record in table_records(detail_soup):
             approval_date = record.get("Approval Date", "")
@@ -187,7 +256,7 @@ def enrich_project(session: requests.Session, project: Project) -> Project:
                 values["registration_date"] = approval_date
                 break
     form_page = None
-    if project.form_url:
+    if project.source == "Haryana RERA" and project.form_url:
         try:
             form_page = get_html(session, project.form_url)
         except Exception as exc:  # Optional field; do not suppress the core alert.
@@ -212,6 +281,14 @@ def open_database(path: Path) -> sqlite3.Connection:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS source_baselines (
+            source TEXT PRIMARY KEY,
+            initialized_at TEXT NOT NULL
+        )
+        """
+    )
     connection.commit()
     return connection
 
@@ -226,7 +303,7 @@ def smtp_send(project: Project) -> None:
 
     badge = "[PRIORITY] " if project.priority else ""
     msg = EmailMessage()
-    msg["Subject"] = f"{badge}New Haryana RERA registration: {project.name}"
+    msg["Subject"] = f"{badge}New {project.source} registration: {project.name}"
     msg["From"] = sender
     msg["To"] = recipient
     msg["Date"] = format_datetime(datetime.now(timezone.utc))
@@ -235,6 +312,7 @@ def smtp_send(project: Project) -> None:
     msg["Message-ID"] = f"<hrera-{digest}@{domain or 'localhost'}>"
 
     rows = [
+        ("Source", project.source),
         ("Project Name", project.name),
         ("RERA Registration Number", project.registration_number),
         ("Portal Project ID", project.portal_project_id),
@@ -244,7 +322,7 @@ def smtp_send(project: Project) -> None:
         ("Registration Date", project.registration_date),
         ("Project Type", project.project_type),
         ("Registered With", project.registered_with),
-        ("Direct Haryana RERA Link", project.detail_url or PORTAL_URL),
+        ("Official Project/Search Link", project.detail_url or PORTAL_URL),
     ]
     priority_text = "PRIORITY CITY\n\n" if project.priority else ""
     msg.set_content(priority_text + "\n".join(f"{label}: {value}" for label, value in rows))
@@ -256,10 +334,10 @@ def smtp_send(project: Project) -> None:
     link = html.escape(project.detail_url or PORTAL_URL, quote=True)
     msg.add_alternative(
         f"""<!doctype html><html><body style="font-family:Arial,sans-serif;color:#172033">
-        <h2>{html.escape(badge)}New Haryana RERA registration</h2>
+        <h2>{html.escape(badge)}New {html.escape(project.source)} registration</h2>
         <table style="border-collapse:collapse;border:1px solid #d1d5db">{html_rows}</table>
         <p><a href="{link}" style="display:inline-block;padding:10px 14px;background:#1d4ed8;color:white;text-decoration:none;border-radius:5px">Open official Haryana RERA record</a></p>
-        <p style="color:#6b7280;font-size:12px">Detected by your Haryana RERA monitor. Source: official Haryana RERA portal.</p>
+        <p style="color:#6b7280;font-size:12px">Detected by your RERA monitor from the official authority portal.</p>
         </body></html>""",
         subtype="html",
     )
@@ -278,6 +356,18 @@ def store_baseline(db: sqlite3.Connection, projects: list[Project]) -> None:
     db.executemany(
         "INSERT OR IGNORE INTO registrations(registration_key, first_seen_at, notified_at, payload) VALUES (?, ?, ?, ?)",
         ((p.key, now, now, repr(asdict(p))) for p in projects),
+    )
+    db.commit()
+
+
+def source_initialized(db: sqlite3.Connection, source: str) -> bool:
+    return db.execute("SELECT 1 FROM source_baselines WHERE source=?", (source,)).fetchone() is not None
+
+
+def mark_source_initialized(db: sqlite3.Connection, source: str) -> None:
+    db.execute(
+        "INSERT OR IGNORE INTO source_baselines(source, initialized_at) VALUES (?, ?)",
+        (source, datetime.now(timezone.utc).isoformat()),
     )
     db.commit()
 
@@ -321,15 +411,43 @@ def process_snapshot(db: sqlite3.Connection, session: requests.Session, projects
 
 
 def check_once(db: sqlite3.Connection, session: requests.Session) -> tuple[int, int]:
-    projects = extract_registered_projects(get_html(session, PORTAL_URL))
-    total = db.execute("SELECT COUNT(*) FROM registrations").fetchone()[0]
-    if total == 0 and not env_bool("ALERT_ON_FIRST_RUN"):
-        store_baseline(db, projects)
-        logging.info("Baseline created with %d existing registrations; no historical alerts sent", len(projects))
-        return len(projects), 0
-    sent = process_snapshot(db, session, projects)
-    logging.info("Checked %d registrations; %d alert(s) sent", len(projects), sent)
-    return len(projects), sent
+    fetchers = {
+        "Haryana RERA": lambda: extract_registered_projects(get_html(session, PORTAL_URL)),
+        "UP RERA": lambda: get_up_rera_projects(session),
+    }
+    total_projects = 0
+    sent = 0
+    successful_sources = 0
+    for source, fetch in fetchers.items():
+        try:
+            projects = fetch()
+        except Exception:
+            logging.exception("%s check failed; other sources will still be processed", source)
+            continue
+        successful_sources += 1
+        total_projects += len(projects)
+        if not source_initialized(db, source):
+            if not env_bool("ALERT_ON_FIRST_RUN"):
+                store_baseline(db, projects)
+                mark_source_initialized(db, source)
+                logging.info(
+                    "%s baseline created with %d existing registrations; no historical alerts sent",
+                    source,
+                    len(projects),
+                )
+                continue
+            mark_source_initialized(db, source)
+        sent += process_snapshot(db, session, projects)
+    if successful_sources == 0:
+        raise RuntimeError("All RERA sources failed")
+    logging.info(
+        "Checked %d registrations across %d/%d sources; %d alert(s) sent",
+        total_projects,
+        successful_sources,
+        len(fetchers),
+        sent,
+    )
+    return total_projects, sent
 
 
 def handle_stop(_signum: int, _frame: object) -> None:
@@ -363,6 +481,7 @@ def main() -> int:
                 form_url="",
                 registration_date=datetime.now().strftime("%d-%b-%Y"),
                 project_type="Test",
+                source="Haryana RERA",
             )
         )
         logging.info("Test email sent successfully")

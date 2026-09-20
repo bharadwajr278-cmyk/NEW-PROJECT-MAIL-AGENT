@@ -1,6 +1,6 @@
 import unittest
 
-from monitor import Project, extract_registered_projects, infer_project_type
+from monitor import Project, extract_registered_projects, extract_up_rera_projects, infer_project_type
 
 
 class MonitorTests(unittest.TestCase):
@@ -25,6 +25,21 @@ class MonitorTests(unittest.TestCase):
     def test_type_inference_uses_strong_phrase(self):
         p = Project("R1", "P1", "Affordable Plotted Colony", "B", "Sector 1", "GURUGRAM", "HRERA", "", "", "")
         self.assertEqual(infer_project_type(p, None), "Residential – Plotted Development")
+
+    def test_extracts_up_rera_feed_with_quoted_title(self):
+        record = (
+            '[{"application_id":"169926","registration_id":"UPRERAPRJ574384/09/2026",'
+            '"promoter_name":"Gaursons Realtech Private Limited",'
+            '"project_name":""1st Park View" - Gaur Yamuna City",'
+            '"applicant_type":"New","district":"Gautam Buddha Nagar",'
+            '"Project_catagory":"Residential","Project_type":""}]'
+        )
+        projects = extract_up_rera_projects(record * 501)
+        self.assertEqual(projects[0].registration_number, "UPRERAPRJ574384/09/2026")
+        self.assertEqual(projects[0].city, "NOIDA / GREATER NOIDA")
+        self.assertEqual(projects[0].project_type, "Residential (New)")
+        self.assertTrue(projects[0].priority)
+        self.assertTrue(projects[0].key.startswith("UP RERA::"))
 
 
 if __name__ == "__main__":

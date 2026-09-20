@@ -1,6 +1,13 @@
-# Haryana RERA new-registration email monitor
+# Haryana + UP RERA new-registration email monitor
 
-This service polls the official statewide Haryana RERA registered-project list and emails each newly appearing registration to `bharadwajr278@gmail.com`. Gurugram and Faridabad alerts are marked `[PRIORITY]`; all Haryana districts are still monitored.
+This service polls the official statewide Haryana RERA registered-project list and the official UP RERA Gautam Buddha Nagar district feed. It emails each newly appearing registration to `bharadwajr278@gmail.com`.
+
+Priority coverage:
+
+- Gurugram and Faridabad on Haryana RERA
+- Noida, Greater Noida, and Yamuna Expressway projects registered under Gautam Buddha Nagar on UP RERA
+
+All Haryana districts remain monitored.
 
 ## What the alert contains
 
@@ -10,9 +17,9 @@ This service polls the official statewide Haryana RERA registered-project list a
 - Location and city/district
 - Registration approval date (looked up from the official detail page)
 - Project type when a strong public category phrase is available
-- Direct official Haryana RERA link
+- Official RERA project/search link
 
-SQLite stores every observed registration key. The first run creates a baseline and does **not** send hundreds of historical emails. A newly detected record is queued until email succeeds and then marked notified, preventing normal restart/poll duplicates.
+SQLite stores every observed registration key with its authority source. Each source gets its own first-run baseline, so adding UP RERA does **not** send hundreds of historical emails. A newly detected record is queued until email succeeds and then marked notified, preventing normal restart/poll duplicates.
 
 ## Quick start on Windows
 
@@ -57,14 +64,18 @@ python monitor.py --test-email
 
 ## Operations
 
-- Default polling is every 120 seconds, giving an expected detection delay of roughly 0–2 minutes after the portal publishes a record, plus email delivery time.
+- Default polling is every 120 seconds, giving an expected detection delay of roughly 0–2 minutes after an authority feed publishes a record, plus email delivery time.
 - The monitor never bypasses authentication, CAPTCHA, or access controls.
 - HTTP failures retry with backoff; a partial-looking page is rejected instead of being treated as a new state.
 - Failed emails stay queued and retry on a later poll.
 - Keep `.env` private and back up `data/haryana_rera.sqlite3`.
 
-## Official source
+## Official sources
 
 `https://haryanarera.gov.in/admincontrol/registered_projects/1`
 
-The monitor can only detect a registration after Haryana RERA publishes it on this public page. Portal maintenance, delayed publication, or email-provider delays are outside the monitor's control.
+`https://www.up-rera.in/View_projects.aspx`
+
+The UP RERA browser search is CAPTCHA-protected and is not automated or bypassed. The monitor uses the public Gautam Buddha Nagar district service called by UP RERA's own project map.
+
+The monitor can only detect a registration after the relevant authority publishes it in its public feed. Portal maintenance, delayed publication, or email-provider delays are outside the monitor's control.
