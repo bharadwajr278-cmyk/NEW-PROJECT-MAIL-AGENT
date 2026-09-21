@@ -417,6 +417,63 @@ def process_snapshot(db: sqlite3.Connection, session: requests.Session, projects
     return sent
 
 
+def collect_snapshot(db: sqlite3.Connection, session: requests.Session, projects: list[Project]) -> int:
+    """Queue and enrich new projects without sending or marking them notified."""
+    now = datetime.now(timezone.utc).isoformat()
+    known = {row[0] for row in db.execute("SELECT registration_key FROM registrations")}
+    new_projects = [p for p in projects if p.key not in known]
+    for project in new_projects:
+        db.execute(
+            "INSERT OR IGNORE INTO registrations(registration_key, first_seen_at, payload) VALUES (?, ?, ?)",
+            (project.key, now, project_json(project)),
+        )
+    db.commit()
+
+    pending = {row[0] for row in db.execute("SELECT registration_key FROM registrations WHERE notified_at IS NULL")}
+    pending_projects_for_source = [p for p in projects if p.key in pending]
+    for project in pending_projects_for_source:
+        try:
+            enriched = enrich_project(session, project)
+            db.execute(
+                "UPDATE registrations SET payload=?, last_error=NULL WHERE registration_key=?",
+                (project_json(enriched), project.key),
+            )
+            db.commit()
+            sync_admin_projects(session, [enriched], "pending")
+        except Exception as exc:
+            db.execute(
+                "UPDATE registrations SET last_error=? WHERE registration_key=?",
+                (clean(str(exc))[:1000], project.key),
+            )
+            db.commit()
+            logging.exception("Could not enrich queued project %s", project.key)
+    return len(pending_projects_for_source)
+
+
+def pending_projects(db: sqlite3.Connection) -> list[dict[str, object]]:
+    rows = db.execute(
+        "SELECT registration_key, first_seen_at, payload FROM registrations "
+        "WHERE notified_at IS NULL ORDER BY first_seen_at"
+    ).fetchall()
+    result: list[dict[str, object]] = []
+    for registration_key, first_seen_at, payload in rows:
+        project = json.loads(payload)
+        project["registration_key"] = registration_key
+        project["first_seen_at"] = first_seen_at
+        result.append(project)
+    return result
+
+
+def mark_notified(db: sqlite3.Connection, registration_key: str) -> bool:
+    cursor = db.execute(
+        "UPDATE registrations SET notified_at=?, attempts=attempts+1, last_error=NULL "
+        "WHERE registration_key=? AND notified_at IS NULL",
+        (datetime.now(timezone.utc).isoformat(), registration_key),
+    )
+    db.commit()
+    return cursor.rowcount == 1
+
+
 def sync_admin_projects(
     session: requests.Session,
     projects: list[Project],
@@ -473,7 +530,9 @@ def sync_admin_projects(
     return True
 
 
-def check_once(db: sqlite3.Connection, session: requests.Session) -> tuple[int, int]:
+def check_once(
+    db: sqlite3.Connection, session: requests.Session, *, collect_only: bool = False
+) -> tuple[int, int]:
     fetchers = {
         "Haryana RERA": lambda: extract_registered_projects(get_html(session, PORTAL_URL)),
         "UP RERA": lambda: get_up_rera_projects(session),
@@ -509,15 +568,19 @@ def check_once(db: sqlite3.Connection, session: requests.Session) -> tuple[int, 
             and sync_admin_projects(session, projects, "baseline")
         ):
             mark_source_initialized(db, f"Admin dashboard: {source}")
-        sent += process_snapshot(db, session, projects)
+        if collect_only:
+            sent += collect_snapshot(db, session, projects)
+        else:
+            sent += process_snapshot(db, session, projects)
     if successful_sources == 0:
         raise RuntimeError("All RERA sources failed")
     logging.info(
-        "Checked %d registrations across %d/%d sources; %d alert(s) sent",
+        "Checked %d registrations across %d/%d sources; %d alert(s) %s",
         total_projects,
         successful_sources,
         len(fetchers),
         sent,
+        "queued" if collect_only else "sent",
     )
     return total_projects, sent
 
@@ -538,6 +601,19 @@ def main() -> int:
     interval = max(60, int(os.getenv("POLL_INTERVAL_SECONDS", "120")))
     db = open_database(state_path)
     session = make_session()
+    if "--pending-json" in sys.argv:
+        print(json.dumps(pending_projects(db), ensure_ascii=False))
+        db.close()
+        return 0
+    if "--mark-notified" in sys.argv:
+        position = sys.argv.index("--mark-notified")
+        if position + 1 >= len(sys.argv):
+            logging.error("--mark-notified requires a registration key")
+            db.close()
+            return 2
+        updated = mark_notified(db, sys.argv[position + 1])
+        db.close()
+        return 0 if updated else 1
     if "--test-email" in sys.argv:
         smtp_send(
             Project(
@@ -559,11 +635,12 @@ def main() -> int:
         logging.info("Test email sent successfully")
         db.close()
         return 0
-    once = "--once" in sys.argv
+    once = "--once" in sys.argv or "--collect-only" in sys.argv
+    collect_only = "--collect-only" in sys.argv
     failures = 0
     while not STOP:
         try:
-            check_once(db, session)
+            check_once(db, session, collect_only=collect_only)
             failures = 0
         except Exception:
             failures += 1

@@ -81,6 +81,18 @@ After adding SMTP credentials, send one clearly labelled test message with:
 python monitor.py --test-email
 ```
 
+For an external mail sender such as the connected Gmail integration, collect new
+records without SMTP and inspect the durable queue with:
+
+```powershell
+python monitor.py --collect-only
+python monitor.py --pending-json
+python monitor.py --mark-notified "Haryana RERA::registration-key"
+```
+
+Only mark a key after its email succeeds. This preserves retry behavior and
+duplicate prevention across scheduled runs.
+
 ## Operations
 
 - Default polling is every 120 seconds, giving an expected detection delay of roughly 0–2 minutes after an authority feed publishes a record, plus email delivery time.

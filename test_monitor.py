@@ -1,6 +1,17 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
-from monitor import Project, extract_registered_projects, extract_up_rera_projects, infer_project_type
+from monitor import (
+    Project,
+    extract_registered_projects,
+    extract_up_rera_projects,
+    infer_project_type,
+    mark_notified,
+    open_database,
+    pending_projects,
+)
 
 
 class MonitorTests(unittest.TestCase):
@@ -40,6 +51,22 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(projects[0].project_type, "Residential (New)")
         self.assertTrue(projects[0].priority)
         self.assertTrue(projects[0].key.startswith("UP RERA::"))
+
+    def test_pending_json_and_mark_notified(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = open_database(Path(folder) / "state.sqlite3")
+            project = Project("R1", "P1", "Queued Project", "Builder", "Sector 1", "GURUGRAM", "HRERA", "", "", "")
+            db.execute(
+                "INSERT INTO registrations(registration_key, first_seen_at, payload) VALUES (?, ?, ?)",
+                (project.key, "2026-09-21T00:00:00+00:00", json.dumps(project.__dict__)),
+            )
+            db.commit()
+            queued = pending_projects(db)
+            self.assertEqual(queued[0]["registration_key"], project.key)
+            self.assertTrue(mark_notified(db, project.key))
+            self.assertEqual(pending_projects(db), [])
+            self.assertFalse(mark_notified(db, project.key))
+            db.close()
 
 
 if __name__ == "__main__":
