@@ -46,6 +46,25 @@ docker compose logs -f
 
 The `data` directory is mounted so the deduplication database survives restarts and upgrades.
 
+## Admin dashboard
+
+The project includes two admin interfaces:
+
+- Hosted owner-only dashboard: `https://rera-mail-admin-bharadwaj.bhardwaj0129.chatgpt.site`
+- Local fallback: `http://localhost:8080` when started through Docker Compose
+
+The dashboard shows project name, RERA number, builder, city, registration date, official link, email status, detection time, and priority-market status. Search and filter controls cover Haryana RERA and UP RERA.
+
+The hosted dashboard uses a private D1 database and a private R2 ingestion-audit bucket. The bucket has no public URL. Dashboard viewing requires the site owner's ChatGPT sign-in. The write API at `/api/ingest` separately requires the secret `ADMIN_API_KEY`; owner-private Sites deployments also require `OAI_SITES_AUTH_TOKEN` in the monitor environment. Never commit either token.
+
+To run the local dashboard without Docker:
+
+```powershell
+.\run-admin.ps1
+```
+
+Set a long random `ADMIN_PASSWORD` first. The local dashboard uses HTTP Basic authentication and reads the same SQLite state as the monitor.
+
 ## Safe verification
 
 To verify scraping without sending email, set `DRY_RUN=true` and `ALERT_ON_FIRST_RUN=false`, then run:
@@ -69,6 +88,7 @@ python monitor.py --test-email
 - HTTP failures retry with backoff; a partial-looking page is rejected instead of being treated as a new state.
 - Failed emails stay queued and retry on a later poll.
 - Keep `.env` private and back up `data/haryana_rera.sqlite3`.
+- The hosted admin API rejects unauthenticated requests and accepts at most 100 validated records per request.
 
 ## Official sources
 

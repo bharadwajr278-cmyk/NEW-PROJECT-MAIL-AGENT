@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="60">
+  <title>RERA Mail Admin</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">LIVE REGISTRATION INTELLIGENCE</p>
+      <h1>RERA Mail Admin</h1>
+      <p class="subtitle">Haryana · Noida · Greater Noida · Yamuna Expressway</p>
+    </div>
+    <div class="live"><span></span> Auto-refresh 60s</div>
+  </header>
+
+  <main>
+    <section class="stats" aria-label="Notification summary">
+      <article><span>Total projects</span><strong>{{ stats.total }}</strong></article>
+      <article><span>Emails sent</span><strong class="green">{{ stats.sent }}</strong></article>
+      <article><span>Pending</span><strong class="amber">{{ stats.pending }}</strong></article>
+      <article><span>Failed</span><strong class="red">{{ stats.failed }}</strong></article>
+      <article><span>Priority markets</span><strong>{{ stats.priority }}</strong></article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">NOTIFICATION LEDGER</p>
+          <h2>Projects & email delivery</h2>
+        </div>
+        <p class="refresh">Updated {{ refreshed_at }}</p>
+      </div>
+
+      <form class="filters" method="get">
+        <label class="search">
+          <span>Search</span>
+          <input name="q" value="{{ filters.get('q', '') }}" placeholder="Project, RERA number, builder…">
+        </label>
+        <label>
+          <span>Source</span>
+          <select name="source">
+            <option value="">All sources</option>
+            {% for item in sources %}<option value="{{ item }}" {% if filters.get('source') == item %}selected{% endif %}>{{ item }}</option>{% endfor %}
+          </select>
+        </label>
+        <label>
+          <span>City</span>
+          <select name="city">
+            <option value="">All cities</option>
+            {% for item in cities %}<option value="{{ item }}" {% if filters.get('city') == item %}selected{% endif %}>{{ item }}</option>{% endfor %}
+          </select>
+        </label>
+        <label>
+          <span>Email status</span>
+          <select name="status">
+            <option value="">All statuses</option>
+            {% for item in ['sent', 'pending', 'failed'] %}<option value="{{ item }}" {% if filters.get('status') == item %}selected{% endif %}>{{ item|title }}</option>{% endfor %}
+          </select>
+        </label>
+        <button type="submit">Apply filters</button>
+        <a class="clear" href="{{ url_for('dashboard') }}">Clear</a>
+      </form>
+
+      <div class="resultbar">
+        <strong>{{ result_count }}</strong> matching projects
+        <span>Page {{ page }} of {{ pages }}</span>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Project</th>
+              <th>RERA number</th>
+              <th>Market</th>
+              <th>Registration</th>
+              <th>Email</th>
+              <th>Detected</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for project in rows %}
+            <tr>
+              <td class="project-cell">
+                <div class="project-title">
+                  {% if project.priority %}<span class="priority" title="Priority market">★</span>{% endif %}
+                  {{ project.name or 'Unnamed project' }}
+                </div>
+                <small>{{ project.builder or 'Builder not available' }}</small>
+                <span class="source">{{ project.source }}</span>
+              </td>
+              <td><code>{{ project.registration_number or 'Not available' }}</code><small>ID {{ project.portal_project_id or '—' }}</small></td>
+              <td><strong>{{ project.city }}</strong><small>{{ project.project_type or 'Type not available' }}</small></td>
+              <td>{{ project.registration_date or 'Not available' }}</td>
+              <td>
+                <span class="status {{ project.status }}">{{ project.status }}</span>
+                <small>{{ project.notified_display }}</small>
+                {% if project.last_error %}<details><summary>Error</summary><p>{{ project.last_error }}</p></details>{% endif %}
+              </td>
+              <td>{{ project.first_seen_display }}<small>{{ project.attempts }} attempt{% if project.attempts != 1 %}s{% endif %}</small></td>
+              <td><a class="open" href="{{ project.detail_url }}" target="_blank" rel="noopener noreferrer">Official ↗</a></td>
+            </tr>
+            {% else %}
+            <tr><td colspan="7" class="empty">No projects match these filters.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      {% if pages > 1 %}
+      <nav class="pagination" aria-label="Pagination">
+        {% set args = filters.to_dict() %}
+        {% if page > 1 %}{% set _ = args.update({'page': page - 1}) %}<a href="{{ url_for('dashboard', **args) }}">← Previous</a>{% else %}<span></span>{% endif %}
+        <span>{{ page }} / {{ pages }}</span>
+        {% if page < pages %}{% set _ = args.update({'page': page + 1}) %}<a href="{{ url_for('dashboard', **args) }}">Next →</a>{% endif %}
+      </nav>
+      {% endif %}
+    </section>
+  </main>
+  <footer>Read-only dashboard · Email recipient {{ rows[0].recipient if rows else 'configured in EMAIL_TO' }}</footer>
+</body>
+</html>

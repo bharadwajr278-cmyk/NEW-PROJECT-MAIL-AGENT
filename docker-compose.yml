@@ -5,3 +5,15 @@ services:
     env_file: .env
     volumes:
       - ./data:/app/data
+
+  rera-admin:
+    build: .
+    restart: unless-stopped
+    command: ["waitress-serve", "--host=0.0.0.0", "--port=8080", "admin:app"]
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - haryana-rera-monitor

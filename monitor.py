@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
 import logging
 import os
 import random
@@ -78,6 +79,10 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 def clean(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
+
+
+def project_json(project: Project) -> str:
+    return json.dumps(asdict(project), ensure_ascii=False, separators=(",", ":"))
 
 
 def make_session() -> requests.Session:
@@ -336,7 +341,7 @@ def smtp_send(project: Project) -> None:
         f"""<!doctype html><html><body style="font-family:Arial,sans-serif;color:#172033">
         <h2>{html.escape(badge)}New {html.escape(project.source)} registration</h2>
         <table style="border-collapse:collapse;border:1px solid #d1d5db">{html_rows}</table>
-        <p><a href="{link}" style="display:inline-block;padding:10px 14px;background:#1d4ed8;color:white;text-decoration:none;border-radius:5px">Open official Haryana RERA record</a></p>
+        <p><a href="{link}" style="display:inline-block;padding:10px 14px;background:#1d4ed8;color:white;text-decoration:none;border-radius:5px">Open official RERA record</a></p>
         <p style="color:#6b7280;font-size:12px">Detected by your RERA monitor from the official authority portal.</p>
         </body></html>""",
         subtype="html",
@@ -355,7 +360,7 @@ def store_baseline(db: sqlite3.Connection, projects: list[Project]) -> None:
     now = datetime.now(timezone.utc).isoformat()
     db.executemany(
         "INSERT OR IGNORE INTO registrations(registration_key, first_seen_at, notified_at, payload) VALUES (?, ?, ?, ?)",
-        ((p.key, now, now, repr(asdict(p))) for p in projects),
+        ((p.key, now, now, project_json(p)) for p in projects),
     )
     db.commit()
 
@@ -379,7 +384,7 @@ def process_snapshot(db: sqlite3.Connection, session: requests.Session, projects
     for project in new_projects:
         db.execute(
             "INSERT OR IGNORE INTO registrations(registration_key, first_seen_at, payload) VALUES (?, ?, ?)",
-            (project.key, now, repr(asdict(project))),
+            (project.key, now, project_json(project)),
         )
     db.commit()
 
@@ -395,11 +400,12 @@ def process_snapshot(db: sqlite3.Connection, session: requests.Session, projects
                 smtp_send(enriched)
             db.execute(
                 "UPDATE registrations SET notified_at=?, payload=?, attempts=attempts+1, last_error=NULL WHERE registration_key=?",
-                (datetime.now(timezone.utc).isoformat(), repr(asdict(enriched)), project.key),
+                (datetime.now(timezone.utc).isoformat(), project_json(enriched), project.key),
             )
             db.commit()
             sent += 1
             logging.info("Alert sent for %s (%s)", enriched.name, enriched.registration_number)
+            sync_admin_projects(session, [enriched], "sent")
         except Exception as exc:
             db.execute(
                 "UPDATE registrations SET attempts=attempts+1, last_error=? WHERE registration_key=?",
@@ -407,7 +413,64 @@ def process_snapshot(db: sqlite3.Connection, session: requests.Session, projects
             )
             db.commit()
             logging.exception("Alert failed for %s; it remains queued", project.key)
+            sync_admin_projects(session, [project], "failed", error=clean(str(exc))[:3000])
     return sent
+
+
+def sync_admin_projects(
+    session: requests.Session,
+    projects: list[Project],
+    email_status: str,
+    *,
+    error: str | None = None,
+) -> bool:
+    base_url = os.getenv("ADMIN_API_URL", "").strip().rstrip("/")
+    api_key = os.getenv("ADMIN_API_KEY", "").strip()
+    sites_auth_token = os.getenv("OAI_SITES_AUTH_TOKEN", "").strip()
+    if not base_url or not api_key or not projects:
+        return False
+    now = datetime.now(timezone.utc).isoformat()
+    recipient = os.getenv("EMAIL_TO", "bharadwajr278@gmail.com").strip()
+    for offset in range(0, len(projects), 100):
+        batch = []
+        for project in projects[offset : offset + 100]:
+            batch.append(
+                {
+                    "id": project.key,
+                    "source": project.source,
+                    "project_name": project.name,
+                    "rera_number": project.registration_number,
+                    "portal_project_id": project.portal_project_id,
+                    "developer": project.builder,
+                    "location": project.location,
+                    "city": project.city,
+                    "registration_date": project.registration_date,
+                    "project_type": project.project_type,
+                    "official_url": project.detail_url,
+                    "email_status": email_status,
+                    "email_recipient": recipient,
+                    "first_seen_at": now,
+                    "notified_at": now if email_status == "sent" else None,
+                    "attempts": 1 if email_status in {"sent", "failed"} else 0,
+                    "last_error": error,
+                    "priority": project.priority,
+                }
+            )
+        try:
+            headers = {"Authorization": f"Bearer {api_key}"}
+            if sites_auth_token:
+                headers["OAI-Sites-Authorization"] = f"Bearer {sites_auth_token}"
+            response = session.post(
+                f"{base_url}/api/ingest",
+                json={"notifications": batch},
+                headers=headers,
+                timeout=(15, 60),
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            logging.warning("Admin dashboard sync failed: %s", clean(str(exc)))
+            return False
+    return True
 
 
 def check_once(db: sqlite3.Connection, session: requests.Session) -> tuple[int, int]:
@@ -430,6 +493,9 @@ def check_once(db: sqlite3.Connection, session: requests.Session) -> tuple[int, 
             if not env_bool("ALERT_ON_FIRST_RUN"):
                 store_baseline(db, projects)
                 mark_source_initialized(db, source)
+                if env_bool("ADMIN_SYNC_BASELINE", True):
+                    if sync_admin_projects(session, projects, "baseline"):
+                        mark_source_initialized(db, f"Admin dashboard: {source}")
                 logging.info(
                     "%s baseline created with %d existing registrations; no historical alerts sent",
                     source,
@@ -437,6 +503,12 @@ def check_once(db: sqlite3.Connection, session: requests.Session) -> tuple[int, 
                 )
                 continue
             mark_source_initialized(db, source)
+        if (
+            env_bool("ADMIN_SYNC_BASELINE", True)
+            and not source_initialized(db, f"Admin dashboard: {source}")
+            and sync_admin_projects(session, projects, "baseline")
+        ):
+            mark_source_initialized(db, f"Admin dashboard: {source}")
         sent += process_snapshot(db, session, projects)
     if successful_sources == 0:
         raise RuntimeError("All RERA sources failed")
